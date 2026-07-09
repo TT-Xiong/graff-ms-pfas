@@ -160,25 +160,65 @@ def load_nist_vocab_from_checkpoint(checkpoint_path):
     return vocab.reset_index(drop=True)
 
 
-def transfer_graff_weights(model, checkpoint_path):
+def _nist_vocab_row_lut(nist_vocab):
+    """Map (formula, kind) to NIST clf row index (row 0 reserved for pad)."""
+    return {
+        (row.formula, row.kind): i + 1
+        for i, row in nist_vocab.reset_index(drop=True).iterrows()
+    }
+
+
+def _transfer_clf_by_formula(model_sd, pretrained_sd, target_vocab, nist_vocab):
+    """Copy clf rows where PFAS vocab entries match NIST (formula, kind) keys."""
+    nist_lut = _nist_vocab_row_lut(nist_vocab)
+    n_old_clf = pretrained_sd['clf.weight'].shape[0]
+    matched = 0
+
+    for j, row in target_vocab.reset_index(drop=True).iterrows():
+        nist_row = nist_lut.get((row.formula, row.kind))
+        pfas_row = j + 1
+        if nist_row is None or nist_row >= n_old_clf:
+            continue
+        model_sd['clf.weight'][pfas_row] = pretrained_sd['clf.weight'][nist_row]
+        model_sd['clf.bias'][pfas_row] = pretrained_sd['clf.bias'][nist_row]
+        matched += 1
+
+    return matched
+
+
+def transfer_graff_weights(
+    model,
+    checkpoint_path,
+    *,
+    target_vocab,
+    vocab_mode='union',
+    transfer_mode='auto',
+):
     """
     Transfer NIST-pretrained weights into a PFAS model.
 
     - GNN / decoder / isotope_shift: copy when shapes match
     - cov_emb: skip (NIST 7-dim vs PFAS 11-dim)
-    - clf: copy overlapping output rows; leave new vocab rows initialized
-    - vocab buffers: skip (rebuilt from merged vocab)
+    - clf (union): copy first NIST rows; append random rows for extensions
+    - clf (pfas / clf_map): copy rows matched by (formula, kind)
+    - clf (backbone): skip clf entirely
+    - vocab buffers: skip (rebuilt from target vocab)
     """
     ckpt = _torch_load_checkpoint(checkpoint_path)
     pretrained_sd = ckpt['state_dict']
     model_sd = model.state_dict()
+    nist_vocab = load_nist_vocab_from_checkpoint(checkpoint_path)
 
     n_old_clf = pretrained_sd['clf.weight'].shape[0]
     n_new_clf = model_sd['clf.weight'].shape[0]
 
+    if transfer_mode == 'auto':
+        transfer_mode = 'union' if vocab_mode == 'union' else 'clf_map'
+
     transferred = []
     skipped = []
-    expanded = []
+    clf_copied = 0
+    clf_mode = transfer_mode
 
     for key, value in pretrained_sd.items():
         if key.startswith('cov_emb.') or key.startswith('vocab_mzs') or key.startswith('vocab_kinds'):
@@ -189,13 +229,6 @@ def transfer_graff_weights(model, checkpoint_path):
             continue
 
         if key in ('clf.weight', 'clf.bias'):
-            if n_new_clf < n_old_clf:
-                raise ValueError(
-                    f'Union vocab ({n_new_clf - 1} entries) is smaller than NIST '
-                    f'checkpoint vocab ({n_old_clf - 1} entries).'
-                )
-            model_sd[key][:n_old_clf] = value
-            expanded.append(key)
             continue
 
         if model_sd[key].shape != value.shape:
@@ -205,11 +238,38 @@ def transfer_graff_weights(model, checkpoint_path):
         model_sd[key] = value
         transferred.append(key)
 
+    if clf_mode == 'backbone':
+        print('clf: skipped (backbone-only transfer)', flush=True)
+    elif clf_mode == 'union':
+        if n_new_clf < n_old_clf:
+            raise ValueError(
+                f'Union vocab ({n_new_clf - 1} entries) is smaller than NIST '
+                f'checkpoint vocab ({n_old_clf - 1} entries).'
+            )
+        model_sd['clf.weight'][:n_old_clf] = pretrained_sd['clf.weight']
+        model_sd['clf.bias'][:n_old_clf] = pretrained_sd['clf.bias']
+        clf_copied = n_old_clf - 1
+        print(
+            f'clf: copied first {clf_copied} NIST rows; '
+            f'{n_new_clf - n_old_clf} extension rows left randomly initialized',
+            flush=True,
+        )
+    elif clf_mode == 'clf_map':
+        clf_copied = _transfer_clf_by_formula(
+            model_sd, pretrained_sd, target_vocab, nist_vocab,
+        )
+        print(
+            f'clf: mapped {clf_copied}/{len(target_vocab)} PFAS vocab rows from NIST '
+            f'by (formula, kind)',
+            flush=True,
+        )
+    else:
+        raise ValueError(f'Unknown transfer_mode: {transfer_mode}')
+
     model.load_state_dict(model_sd)
     print(
-        f'Loaded checkpoint: {len(transferred)} tensors copied, '
-        f'{len(expanded)} clf rows partially copied ({n_old_clf - 1} NIST + '
-        f'{n_new_clf - n_old_clf} new), {len(skipped)} skipped (cov_emb / buffers).',
+        f'Loaded checkpoint: {len(transferred)} backbone tensors copied, '
+        f'{len(skipped)} skipped (cov_emb / buffers / clf handled separately).',
         flush=True,
     )
 
@@ -223,7 +283,7 @@ parser.add_argument('df_path')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--vocab_size', type=int, default=10000)
 parser.add_argument('--batch_size', type=int, default=512)
-parser.add_argument('--learning_rate', type=int, default=5e-4)
+parser.add_argument('--learning_rate', type=float, default=5e-4)
 parser.add_argument('--grad_clipping', type=int, default=100)
 parser.add_argument('--max_epochs', type=int, default=100)
 parser.add_argument('--gpus', type=int, default=1)
@@ -266,6 +326,13 @@ parser.add_argument(
     type=int,
     default=2000,
     help='Max PFAS-only (formula, kind) entries appended in union vocab mode',
+)
+parser.add_argument(
+    '--transfer_mode',
+    choices=['auto', 'union', 'clf_map', 'backbone'],
+    default='auto',
+    help='Weight transfer for clf: auto (union slice or PFAS formula map), '
+         'union (NIST row prefix), clf_map (match formula/kind), backbone (skip clf)',
 )
 args = parser.parse_args()
 
@@ -310,8 +377,14 @@ print(f'Dataset mode: {args.dataset} ({len(df)} spectra)')
 if args.vocab_mode is None:
     args.vocab_mode = 'union' if args.checkpoint else 'pfas'
 
-if args.checkpoint and args.vocab_mode != 'union':
-    print('Warning: --checkpoint set but vocab_mode is not union; clf rows may not align.', flush=True)
+if args.checkpoint and args.vocab_mode == 'pfas' and args.transfer_mode == 'auto':
+    print(
+        'PFAS vocab + checkpoint: clf rows will be mapped by (formula, kind); '
+        'unmatched rows stay randomly initialized.',
+        flush=True,
+    )
+elif args.checkpoint and args.vocab_mode == 'pfas' and args.transfer_mode == 'union':
+    raise ValueError('transfer_mode=union requires vocab_mode=union.')
 
 if args.vocab_mode == 'union' and not args.checkpoint:
     raise ValueError('--vocab_mode union requires --checkpoint with a NIST vocab.')
@@ -506,7 +579,10 @@ trainer = pl.Trainer(
 
 _graff_hparams = {
     k: v for k, v in args.__dict__.items()
-    if k not in {'df_path', 'dataset', 'checkpoint', 'vocab_mode', 'pfas_extension_size'}
+    if k not in {
+        'df_path', 'dataset', 'checkpoint', 'vocab_mode',
+        'pfas_extension_size', 'transfer_mode',
+    }
 }
 
 model = GrAFF(
@@ -519,6 +595,12 @@ model = GrAFF(
 )
 
 if args.checkpoint:
-    transfer_graff_weights(model, args.checkpoint)
+    transfer_graff_weights(
+        model,
+        args.checkpoint,
+        target_vocab=vocab,
+        vocab_mode=args.vocab_mode,
+        transfer_mode=args.transfer_mode,
+    )
 
 trainer.fit(model, loaders['train'], loaders['val'])
