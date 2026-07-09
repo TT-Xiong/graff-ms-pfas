@@ -139,6 +139,8 @@ def fill_block(
     block: str,
     *,
     ppm: float,
+    da_tol: float,
+    match_mode: str,
     min_relative_intensity: float,
     max_candidates_per_peak: int,
     spectrum_ids: Optional[set],
@@ -197,6 +199,8 @@ def fill_block(
         inten_arr,
         prec_comp,
         ppm_tolerance=ppm,
+        da_tolerance=da_tol,
+        match_mode=match_mode,
         min_relative_intensity=min_relative_intensity,
         max_candidates_per_peak=max_candidates_per_peak,
     )
@@ -225,6 +229,8 @@ def process_msp(
     path: Path,
     *,
     ppm: float,
+    da_tol: float,
+    match_mode: str,
     min_relative_intensity: float,
     max_candidates_per_peak: int,
     spectrum_ids: Optional[set],
@@ -244,6 +250,8 @@ def process_msp(
         new_block, stats = fill_block(
             block,
             ppm=ppm,
+            da_tol=da_tol,
+            match_mode=match_mode,
             min_relative_intensity=min_relative_intensity,
             max_candidates_per_peak=max_candidates_per_peak,
             spectrum_ids=spectrum_ids,
@@ -260,6 +268,7 @@ def process_msp(
     mean_after = cov_after_sum / n_proc if n_proc else 0.0
 
     print(f"{path.name}: {len(blocks)} spectra, {n_proc} processed")
+    print(f"  match: mode={match_mode}, ppm={ppm}, da={da_tol}")
     print(f"  peaks filled: {total_filled}")
     print(f"  mean coverage: {mean_before:.1%} -> {mean_after:.1%}")
 
@@ -311,6 +320,18 @@ def main() -> None:
     p.add_argument("msp", nargs="+", type=Path, help="MSP file(s) to update (e.g. train.msp val.msp)")
     p.add_argument("--ppm", type=float, default=30.0, help="Mass tolerance in ppm (default: 30)")
     p.add_argument(
+        "--da-tol",
+        type=float,
+        default=0.02,
+        help="Absolute |Δm| tolerance in Da (default: 0.02)",
+    )
+    p.add_argument(
+        "--match-mode",
+        choices=("ppm", "da", "hybrid"),
+        default="hybrid",
+        help="Peak matching: ppm, da, or hybrid (ppm OR da, default: hybrid)",
+    )
+    p.add_argument(
         "--min-relative-intensity",
         type=float,
         default=0.01,
@@ -350,6 +371,8 @@ def main() -> None:
         process_msp(
             msp_path,
             ppm=args.ppm,
+            da_tol=args.da_tol,
+            match_mode=args.match_mode,
             min_relative_intensity=args.min_relative_intensity,
             max_candidates_per_peak=args.max_candidates_per_peak,
             spectrum_ids=sid_filter,

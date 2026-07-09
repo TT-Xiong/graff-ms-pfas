@@ -16,6 +16,12 @@ def main() -> None:
     )
     p.add_argument("msp", nargs="+", type=Path)
     p.add_argument("--enum-ppm", type=float, default=30.0)
+    p.add_argument("--enum-da-tol", type=float, default=0.02)
+    p.add_argument(
+        "--enum-match-mode",
+        choices=("ppm", "da", "hybrid"),
+        default="hybrid",
+    )
     p.add_argument("--magma-ppm", type=float, default=30.0)
     p.add_argument("--min-relative-intensity", type=float, default=0.01)
     p.add_argument("--max-candidates-per-peak", type=int, default=3)
@@ -38,6 +44,8 @@ def main() -> None:
         process_enum(
             msp_path,
             ppm=args.enum_ppm,
+            da_tol=args.enum_da_tol,
+            match_mode=args.enum_match_mode,
             min_relative_intensity=args.min_relative_intensity,
             max_candidates_per_peak=args.max_candidates_per_peak,
             spectrum_ids=sid_filter,

@@ -211,6 +211,51 @@ def _ppm(obs: float, theo: float) -> float:
     return abs(obs - theo) / theo * 1e6
 
 
+def _mass_match(
+    mz_obs: float,
+    theo: float,
+    *,
+    ppm_tolerance: float,
+    da_tolerance: float,
+    match_mode: str,
+) -> bool:
+    da = abs(mz_obs - theo)
+    ppm = _ppm(mz_obs, theo)
+    if match_mode == "ppm":
+        return ppm <= ppm_tolerance
+    if match_mode == "da":
+        return da <= da_tolerance
+    if match_mode == "hybrid":
+        return (ppm <= ppm_tolerance) or (da <= da_tolerance)
+    raise ValueError(f"Unknown match_mode: {match_mode}")
+
+
+def _search_bounds(
+    mz_obs: float,
+    *,
+    ppm_tolerance: float,
+    da_tolerance: float,
+    match_mode: str,
+) -> Tuple[float, float]:
+    """m/z interval covering all candidates that could pass the active matcher."""
+    if match_mode == "da":
+        return mz_obs - da_tolerance, mz_obs + da_tolerance
+
+    ppm_frac = ppm_tolerance * 1e-6
+    lo_ppm = mz_obs / (1.0 + ppm_frac)
+    hi_ppm = (
+        mz_obs / (1.0 - ppm_frac)
+        if ppm_frac < 1.0
+        else mz_obs * (1.0 + ppm_frac)
+    )
+    if match_mode == "ppm":
+        return lo_ppm, hi_ppm
+
+    lo_da = mz_obs - da_tolerance
+    hi_da = mz_obs + da_tolerance
+    return min(lo_ppm, lo_da), max(hi_ppm, hi_da)
+
+
 def match_peak_candidates(
     mz_obs: float,
     cand_mz: np.ndarray,
@@ -218,10 +263,17 @@ def match_peak_candidates(
     cand_isotopes: Sequence[int],
     *,
     ppm_tolerance: float,
+    da_tolerance: float = 0.02,
+    match_mode: str = "ppm",
     max_candidates: int = 0,
 ) -> List[Tuple[str, int, float]]:
     """
-    Return all (product, isotope, ppm) matches within ±ppm_tolerance.
+    Return all (product, isotope, ppm) matches within the mass tolerance.
+
+    ``match_mode``:
+      - ``ppm``: relative ppm window only (default, legacy)
+      - ``da``: absolute |Δm| window only
+      - ``hybrid``: accept if ppm OR |Δm| criterion is met
 
     Mirrors NIST MSP behaviour where a single peak may list multiple formula
     hypotheses (``;``-separated). Duplicate (product, isotope) pairs are
@@ -230,20 +282,31 @@ def match_peak_candidates(
     if cand_mz.size == 0:
         return []
 
-    ppm_frac = ppm_tolerance * 1e-6
-    lo = mz_obs / (1.0 + ppm_frac)
-    hi = mz_obs / (1.0 - ppm_frac) if ppm_frac < 1.0 else mz_obs * (1.0 + ppm_frac)
+    lo, hi = _search_bounds(
+        mz_obs,
+        ppm_tolerance=ppm_tolerance,
+        da_tolerance=da_tolerance,
+        match_mode=match_mode,
+    )
 
     left = int(np.searchsorted(cand_mz, lo, side="left"))
     right = int(np.searchsorted(cand_mz, hi, side="right"))
 
     best: Dict[Tuple[str, int], float] = {}
     for i in range(left, right):
-        ppm = _ppm(mz_obs, float(cand_mz[i]))
-        if ppm <= ppm_tolerance:
-            key = (cand_products[i], cand_isotopes[i])
-            if key not in best or ppm < best[key]:
-                best[key] = ppm
+        theo = float(cand_mz[i])
+        if not _mass_match(
+            mz_obs,
+            theo,
+            ppm_tolerance=ppm_tolerance,
+            da_tolerance=da_tolerance,
+            match_mode=match_mode,
+        ):
+            continue
+        ppm = _ppm(mz_obs, theo)
+        key = (cand_products[i], cand_isotopes[i])
+        if key not in best or ppm < best[key]:
+            best[key] = ppm
 
     matches = sorted(
         ((prod, iso, ppm) for (prod, iso), ppm in best.items()),
@@ -260,6 +323,8 @@ def annotate_spectrum(
     precursor_comp: Composition,
     *,
     ppm_tolerance: float = 20.0,
+    da_tolerance: float = 0.02,
+    match_mode: str = "ppm",
     min_mz: float = 0.0,
     max_mz: Optional[float] = None,
     min_relative_intensity: float = 0.0,
@@ -297,6 +362,8 @@ def annotate_spectrum(
             cand_products,
             cand_isotopes,
             ppm_tolerance=ppm_tolerance,
+            da_tolerance=da_tolerance,
+            match_mode=match_mode,
             max_candidates=max_candidates_per_peak,
         )
         if not matches:
