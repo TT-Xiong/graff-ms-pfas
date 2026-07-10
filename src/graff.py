@@ -28,9 +28,10 @@ ce_ids = [0, 1, 2, 3]
 ce_bins = [15, 30, 45, 60]
 
 
-def compute_covariates_dim(dataset, *, precursor_types, instruments, ce_ids):
+def compute_covariates_dim(dataset, *, precursor_types, instruments, ce_ids, ce_embed_dim=None):
     if dataset == 'pfas':
-        return len(dissociation_types) + len(ce_ids) + len(precursor_types) + 1
+        ce_part = 0 if ce_embed_dim else len(ce_ids)
+        return len(dissociation_types) + ce_part + len(precursor_types) + 1
     return len(instruments) + len(precursor_types) + 1 + 1
 
 
@@ -46,6 +47,7 @@ def build_covariates(
     precursor_types_list=None,
     instruments_list=None,
     ce_ids_list=None,
+    ce_embed_dim=None,
 ):
     """Build the covariate vector consumed by ``GrAFF.cov_emb``."""
     if dataset == 'pfas':
@@ -55,10 +57,12 @@ def build_covariates(
         ce_idx = int(ce_id)
         diss_onehot = [0.0] * len(dissociation_types)
         diss_onehot[diss_idx] = 1.0
-        ce_onehot = [0.0] * len(ce_list)
-        ce_onehot[ce_idx] = 1.0
         pt_onehot = [0.0] * len(pt_list)
         pt_onehot[pt_list.index(precursor_type)] = 1.0
+        if ce_embed_dim:
+            return np.array([*diss_onehot, *pt_onehot, float(has_isotopes)], dtype=np.float32)
+        ce_onehot = [0.0] * len(ce_list)
+        ce_onehot[ce_idx] = 1.0
         return np.array([*diss_onehot, *ce_onehot, *pt_onehot, float(has_isotopes)], dtype=np.float32)
 
     inst_list = instruments_list or instruments
@@ -97,6 +101,7 @@ class GrAFF(pl.LightningModule):
         cov_conditioning='add',
         cov_emb_dim=None,
         ce_loss_weights=None,
+        ce_embed_dim=None,
         **kwargs
     ):
         super().__init__()
@@ -147,10 +152,17 @@ class GrAFF(pl.LightningModule):
             precursor_types=self.precursor_types,
             instruments=self.instruments,
             ce_ids=self.ce_ids,
+            ce_embed_dim=ce_embed_dim,
         )
         vocab_size = len(vocab)
         self.vocab_size = vocab_size
         self.covariates_dim = covariates_dim
+        self.ce_embed_dim = ce_embed_dim
+        self.cov_in_dim = covariates_dim + (ce_embed_dim or 0)
+        if ce_embed_dim:
+            self.ce_embed = nn.Embedding(len(self.ce_ids), ce_embed_dim)
+        else:
+            self.ce_embed = None
         
         # inference time only
         self.min_probability = min_probability
@@ -211,7 +223,7 @@ class GrAFF(pl.LightningModule):
         
         if cov_conditioning == 'film_decoder':
             self.cov_emb = nn.Sequential(
-                nn.Linear(self.covariates_dim, encoder_dim),
+                nn.Linear(self.cov_in_dim, encoder_dim),
                 nn.SiLU(inplace=True),
                 nn.Dropout(dropout),
                 nn.LayerNorm(encoder_dim),
@@ -219,7 +231,7 @@ class GrAFF(pl.LightningModule):
             )
         else:
             self.cov_emb = nn.Sequential(
-                nn.Linear(self.covariates_dim, self.cov_emb_dim),
+                nn.Linear(self.cov_in_dim, self.cov_emb_dim),
                 nn.SiLU(inplace=True),
                 nn.Dropout(dropout),
                 nn.LayerNorm(self.cov_emb_dim),
@@ -228,7 +240,7 @@ class GrAFF(pl.LightningModule):
 
         if cov_conditioning in ('film_decoder', 'both'):
             self.cov_film = nn.Sequential(
-                nn.Linear(self.covariates_dim, decoder_dim),
+                nn.Linear(self.cov_in_dim, decoder_dim),
                 nn.SiLU(inplace=True),
                 nn.Linear(decoder_dim, decoder_dim * 2),
             )
@@ -267,6 +279,8 @@ class GrAFF(pl.LightningModule):
 
     def _optimizer_param_groups(self):
         cov_emb_params = list(self.cov_emb.parameters())
+        if self.ce_embed is not None:
+            cov_emb_params += list(self.ce_embed.parameters())
         if self.cov_film is not None:
             cov_emb_params += list(self.cov_film.parameters())
         clf_params = list(self.clf.parameters())
@@ -290,6 +304,7 @@ class GrAFF(pl.LightningModule):
                 if param.requires_grad
                 and not name.startswith('cov_emb.')
                 and not name.startswith('cov_film.')
+                and not name.startswith('ce_embed.')
                 and not name.startswith('clf.')
             ]
             if backbone_params:
@@ -317,16 +332,26 @@ class GrAFF(pl.LightningModule):
             print(f'Layer-wise learning rates: {lr_msg}', flush=True)
         return opt
 
-    def _apply_cov_film(self, z, covariates):
+    def _cov_condition_input(self, covariates, ce_id=None):
+        cov_in = covariates.view(covariates.shape[0], self.covariates_dim)
+        if self.ce_embed is not None:
+            if ce_id is None:
+                raise ValueError('batch.ce_id is required when ce_embed is enabled')
+            ce_vec = self.ce_embed(ce_id.view(-1).long())
+            cov_in = torch.cat([cov_in, ce_vec], dim=-1)
+        return cov_in
+
+    def _apply_cov_film(self, z, covariates, ce_id=None):
         if self.cov_film is None:
             return z
-        cov_in = covariates.view(z.shape[0], self.covariates_dim)
+        cov_in = self._cov_condition_input(covariates, ce_id)
         gamma, beta = self.cov_film(cov_in).chunk(2, dim=-1)
         return z * (1.0 + gamma) + beta
     
     def forward(self, g):
         batch_size = len(g.ptr) - 1
         device = g.x.device
+        ce_id = getattr(g, 'ce_id', None)
         
         # embed node, edge, eigenfeatures
         x_atom, x_bond = self.onehot(g.x, g.edge_attr)
@@ -345,10 +370,11 @@ class GrAFF(pl.LightningModule):
         z = pyg.nn.global_add_pool(x_mol * w, g.batch)
         
         # condition molecule representation on covariates
-        z = z + self.cov_emb(g.covariates.view(batch_size, self.covariates_dim))
+        cov_in = self._cov_condition_input(g.covariates, ce_id)
+        z = z + self.cov_emb(cov_in)
         # transform to spectrum representation
         z = self.decoder(z)
-        z = self._apply_cov_film(z, g.covariates)
+        z = self._apply_cov_film(z, g.covariates, ce_id)
         # and predict logits
         log_y_pred = self.clf(z)
         

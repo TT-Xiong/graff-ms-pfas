@@ -196,6 +196,7 @@ class MoleculeFeaturizer:
             g = item['graph'].clone()
 
             if self.dataset == 'pfas':
+                ce_embed_dim = getattr(self.hparams, 'ce_embed_dim', None)
                 covariates = build_covariates(
                     dataset='pfas',
                     precursor_type=item['Precursor_type'],
@@ -204,6 +205,7 @@ class MoleculeFeaturizer:
                     ce_id=int(item['CE_ID']),
                     precursor_types_list=list(self.hparams.precursor_types),
                     ce_ids_list=list(getattr(self.hparams, 'ce_ids', ce_ids) or ce_ids),
+                    ce_embed_dim=ce_embed_dim,
                 )
             else:
                 covariates = build_covariates(
@@ -228,6 +230,8 @@ class MoleculeFeaturizer:
             g.precursor_mz = float(precursor_mz)
             g.has_isotopes = bool(item['has_isotopes'])
             g.covariates = torch.FloatTensor(covariates).view(1, -1)
+            if self.dataset == 'pfas':
+                g.ce_id = torch.tensor([int(item['CE_ID'])], dtype=torch.long)
             g.double_counted = torch.BoolTensor(double_counted).view(1, -1)
             g.mzs = torch.FloatTensor(mzs).view(1, -1)
 

@@ -284,7 +284,7 @@ def transfer_graff_weights(
     Transfer NIST-pretrained weights into a PFAS model.
 
     - GNN / decoder / isotope_shift: copy when shapes match
-    - cov_emb / cov_film: skip (NIST 7-dim vs PFAS 11-dim; CE-FiLM is PFAS-only)
+    - cov_emb / cov_film / ce_embed: skip (NIST 7-dim vs PFAS 11-dim; CE-FiLM/embed are PFAS-only)
     - clf (union): copy first NIST rows; append random rows for extensions
     - clf (pfas / clf_map): copy rows matched by (formula, kind)
     - clf (backbone): skip clf entirely
@@ -307,7 +307,7 @@ def transfer_graff_weights(
     clf_mode = transfer_mode
 
     for key, value in pretrained_sd.items():
-        if key.startswith('cov_emb.') or key.startswith('cov_film.') or key.startswith('vocab_mzs') or key.startswith('vocab_kinds'):
+        if key.startswith('cov_emb.') or key.startswith('cov_film.') or key.startswith('ce_embed.') or key.startswith('vocab_mzs') or key.startswith('vocab_kinds'):
             skipped.append(key)
             continue
         if key not in model_sd:
@@ -478,6 +478,13 @@ parser.add_argument(
     help='PFAS only: per-CE_ID training loss weights, e.g. 0:3.0,1:0.8,2:0.5,3:2.5. '
          'Validation loss stays unweighted.',
 )
+parser.add_argument(
+    '--ce_embed_dim',
+    type=int,
+    default=None,
+    help='PFAS only: learnable CE_ID embedding size (replaces CE one-hot in covariates). '
+         'Try 32 with film_decoder.',
+)
 args = parser.parse_args()
 
 if args.freeze_backbone and args.clf_lr is None:
@@ -528,6 +535,11 @@ else:
         df = df[df['Instrument'].isin(instruments)]
 
 print(f'Dataset mode: {args.dataset} ({len(df)} spectra)')
+
+if args.ce_embed_dim:
+    if args.dataset != 'pfas':
+        raise ValueError('--ce_embed_dim is only supported for PFAS training.')
+    print(f'CE embedding: dim={args.ce_embed_dim} (replaces CE one-hot)', flush=True)
 
 if args.vocab_mode is None:
     args.vocab_mode = 'union' if args.checkpoint else 'pfas'
@@ -670,6 +682,7 @@ def featurize_spectrum(item):
             ce_id=int(item.CE_ID),
             precursor_types_list=active_precursor_types,
             ce_ids_list=ce_ids,
+            ce_embed_dim=args.ce_embed_dim,
         )
     else:
         covariates = build_covariates(
