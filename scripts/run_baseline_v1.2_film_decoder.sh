@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# PFAS baseline v1.1 (fixed): hybrid MSP + union vocab + NIST transfer + anti-overfit.
-#
-# Superseded by v1.2: scripts/run_baseline_v1.2_film_decoder.sh (test ~0.507)
+# PFAS baseline v1.2 (fixed): v1.1 regularize + CE-FiLM on decoder output.
 #
 # Data:  data/pfas/nist_标注/nist_pfas_annot.pkl  (rep3, hybrid enum+MAGMa)
 # Train: union 10k+2k, transfer_mode union, dropout 0.15, wd 1e-4, early stop 8
-# Target: test cosine ~0.50, train-test gap ~0.07 (vs ~0.16 without regularize)
+# Model: --cov_conditioning film_decoder (compact cov_emb + FiLM after decoder)
+# Target: test cosine ~0.507 (best so far), train-test gap ~0.12
+#
+# Supersedes: scripts/run_baseline_v1_regularize.sh (v1.1, test ~0.498)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,12 +16,12 @@ PKL="${PKL:-data/pfas/nist_标注/nist_pfas_annot.pkl}"
 NIST_CKPT="${NIST_CKPT:-lightning_logs/graff-ms/version_0/checkpoints/epoch=96-step=27257.ckpt}"
 TEST_MSP="${TEST_MSP:-data/pfas/nist_标注/test.msp}"
 QUERIES_DIR="${QUERIES_DIR:-data/pfas/nist_标注/queries}"
-OUT_DIR="${OUT_DIR:-output/baseline_v1_regularize}"
+OUT_DIR="${OUT_DIR:-output/baseline_v1.2_film_decoder}"
 GPUS="${GPUS:-1}"
 
 mkdir -p "$OUT_DIR"
 
-echo "=== [1/4] train baseline v1.1 (regularize) ==="
+echo "=== [1/4] train baseline v1.2 (regularize + film_decoder) ==="
 python train-graff-ms.py "$PKL" \
   --dataset pfas \
   --checkpoint "$NIST_CKPT" \
@@ -35,6 +36,7 @@ python train-graff-ms.py "$PKL" \
   --weight_decay 1e-4 \
   --early_stopping_patience 8 \
   --learning_rate 5e-4 \
+  --cov_conditioning film_decoder \
   2>&1 | tee "$OUT_DIR/train.log"
 
 CKPT="$(ls -t lightning_logs/graff/version_*/checkpoints/*.ckpt | head -1)"
@@ -50,7 +52,7 @@ python run-graff-ms.py "$CKPT" "${QUERIES_DIR}/test.tsv" "$OUT_DIR/pred_test.msp
   --has_isotopes 1 --gpus "$GPUS" \
   2>&1 | tee "$OUT_DIR/predict.log"
 
-echo "=== [4/4] cosine + diagnose ==="
+echo "=== [4/4] cosine + diagnose + CE buckets ==="
 python cosine-similarity.py "$OUT_DIR/pred_test.msp" "$TEST_MSP" --matchms_tol 0.1 \
   2>&1 | tee "$OUT_DIR/cosine_test.log"
 
