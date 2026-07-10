@@ -25,12 +25,25 @@ def main() -> None:
         default=REPO_ROOT / "data" / "pfas" / "nist_标注" / "nist_pfas_annot.pkl",
     )
     parser.add_argument("--top-n", type=int, default=15)
+    parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    parser.add_argument(
+        "--ce-id",
+        type=int,
+        default=None,
+        help="If set, only include spectra with this CE_ID.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
-        default=REPO_ROOT / "output" / "test_low_cosine_top15.csv",
+        default=None,
     )
     args = parser.parse_args()
+
+    if args.output is None:
+        suffix = args.split
+        if args.ce_id is not None:
+            suffix = f"{suffix}_ce{args.ce_id}"
+        args.output = REPO_ROOT / "output" / f"{suffix}_low_cosine_top{args.top_n}.csv"
 
     if not args.diagnose_csv.is_file():
         raise FileNotFoundError(
@@ -38,9 +51,9 @@ def main() -> None:
         )
 
     diag = pd.read_csv(args.diagnose_csv)
-    test = diag.query('split=="test"').copy()
-    if len(test) == 0:
-        raise ValueError("No test rows in diagnose CSV")
+    subset = diag.query(f'split=="{args.split}"').copy()
+    if len(subset) == 0:
+        raise ValueError(f"No {args.split} rows in diagnose CSV")
 
     meta_cols = [
         "Spectrum",
@@ -56,11 +69,15 @@ def main() -> None:
         "PrecursorMZ",
     ]
     pkl = pd.read_pickle(args.pkl)
-    meta = pkl.query('split=="test"')[meta_cols].copy()
+    meta = pkl.query(f'split=="{args.split}"')[meta_cols].copy()
     meta["Spectrum"] = meta["Spectrum"].astype(str)
-    test["Spectrum"] = test["Spectrum"].astype(str)
+    subset["Spectrum"] = subset["Spectrum"].astype(str)
 
-    merged = test.merge(meta, on="Spectrum", how="left", suffixes=("", "_meta"))
+    merged = subset.merge(meta, on="Spectrum", how="left", suffixes=("", "_meta"))
+    if args.ce_id is not None:
+        merged = merged.loc[merged["CE_ID"] == args.ce_id].copy()
+        if len(merged) == 0:
+            raise ValueError(f"No {args.split} spectra with CE_ID={args.ce_id}")
     merged["InChIKey14"] = merged["InChIKey"].astype(str).str.split("-").str[0]
     merged = merged.sort_values(["cosine", "intensity_oov"], ascending=[True, False])
 
@@ -81,7 +98,10 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     top.to_csv(args.output, index=False)
 
-    print(f"Test low-cosine Top {args.top_n} -> {args.output}\n")
+    label = args.split
+    if args.ce_id is not None:
+        label = f"{label} CE_ID={args.ce_id}"
+    print(f"{label} low-cosine Top {args.top_n} -> {args.output}\n")
     print(top.to_string(index=False))
 
     print("\n## By dissociation / CE (Top N)")

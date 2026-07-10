@@ -255,6 +255,23 @@ def _transfer_clf_by_formula(model_sd, pretrained_sd, target_vocab, nist_vocab):
     return matched
 
 
+def parse_ce_loss_weights(spec, *, ce_id_values):
+    """Parse '0:3.0,1:0.8' into a list indexed by CE_ID."""
+    if not spec:
+        return None
+    lut = [1.0] * (max(ce_id_values) + 1)
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        key, value = part.split(':')
+        ce_id = int(key.strip())
+        if ce_id not in ce_id_values:
+            raise ValueError(f'Unknown CE_ID {ce_id} in --ce_loss_weights (expected {ce_id_values})')
+        lut[ce_id] = float(value.strip())
+    return lut
+
+
 def transfer_graff_weights(
     model,
     checkpoint_path,
@@ -453,6 +470,13 @@ parser.add_argument(
     type=int,
     default=None,
     help='Hidden width of cov_emb MLP (default: encoder_dim). Try 768 with encoder_dim=512.',
+)
+parser.add_argument(
+    '--ce_loss_weights',
+    type=str,
+    default=None,
+    help='PFAS only: per-CE_ID training loss weights, e.g. 0:3.0,1:0.8,2:0.5,3:2.5. '
+         'Validation loss stays unweighted.',
 )
 args = parser.parse_args()
 
@@ -666,6 +690,7 @@ def featurize_spectrum(item):
 
     g.spectrum = str(item.Spectrum)
     g.split = item.split
+    g.ce_id = torch.tensor([int(item.CE_ID)], dtype=torch.long)
     g.precursor_mz = item.PrecursorMZ
     g.covariates = torch.FloatTensor(covariates).view(1,-1)
     g.product_idx = pad1d(torch.LongTensor(item.product_idx), max_annots).view(1,-1)
@@ -750,12 +775,23 @@ trainer = pl.Trainer(
     callbacks=callbacks,
 )
 
+ce_loss_weight_lut = None
+if args.ce_loss_weights:
+    if args.dataset != 'pfas':
+        raise ValueError('--ce_loss_weights is only supported for PFAS training.')
+    ce_loss_weight_lut = parse_ce_loss_weights(
+        args.ce_loss_weights,
+        ce_id_values=ce_ids,
+    )
+    print(f'CE loss weights (train only): {ce_loss_weight_lut}', flush=True)
+
 _graff_hparams = {
     k: v for k, v in args.__dict__.items()
     if k not in {
         'df_path', 'dataset', 'checkpoint', 'vocab_mode',
         'pfas_extension_size', 'nist_vocab_keep', 'transfer_mode',
         'early_stopping_patience', 'early_stopping_min_delta',
+        'ce_loss_weights',
     }
 }
 
@@ -765,6 +801,7 @@ model = GrAFF(
     instruments=instruments if args.dataset == 'nist' else [],
     dataset=args.dataset,
     ce_ids=ce_ids if args.dataset == 'pfas' else [],
+    ce_loss_weights=ce_loss_weight_lut,
     **_graff_hparams,
 )
 

@@ -96,6 +96,7 @@ class GrAFF(pl.LightningModule):
         cov_emb_lr=None,
         cov_conditioning='add',
         cov_emb_dim=None,
+        ce_loss_weights=None,
         **kwargs
     ):
         super().__init__()
@@ -117,6 +118,12 @@ class GrAFF(pl.LightningModule):
         self.clf_lr = clf_lr
         self.cov_emb_lr = cov_emb_lr
         self.cov_conditioning = cov_conditioning
+        self.use_ce_loss_weights = ce_loss_weights is not None
+        if self.use_ce_loss_weights:
+            self.register_buffer(
+                'ce_loss_weight_lut',
+                torch.tensor(ce_loss_weights, dtype=torch.float32),
+            )
         if cov_emb_dim is not None:
             self.cov_emb_dim = cov_emb_dim
         elif cov_conditioning == 'both':
@@ -392,7 +399,13 @@ class GrAFF(pl.LightningModule):
         mask = torch.isinf(log_y_pred)
         log_y_pred = torch.where(mask, torch.zeros_like(log_y_pred) + self.log_epsilon, log_y_pred)
         
-        loss = -((batch.intensities * log_y_pred).sum(1)).mean()       #交叉熵损失
+        per_sample_loss = -((batch.intensities * log_y_pred).sum(1))
+        if step == 'train' and self.use_ce_loss_weights:
+            ce_idx = batch.ce_id.view(-1).long()
+            sample_weights = self.ce_loss_weight_lut[ce_idx]
+            loss = (per_sample_loss * sample_weights).mean()
+        else:
+            loss = per_sample_loss.mean()
         
         self.log(f'{step}/loss', loss, batch_size=batch_size, sync_dist=step=='val')
         
