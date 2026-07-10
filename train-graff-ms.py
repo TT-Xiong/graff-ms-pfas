@@ -411,7 +411,28 @@ parser.add_argument(
     help='Weight transfer for clf: auto (union slice or PFAS formula map), '
          'union (NIST row prefix), clf_map (match formula/kind), backbone (skip clf)',
 )
+parser.add_argument(
+    '--freeze_backbone',
+    action='store_true',
+    help='Freeze GNN/decoder/isotope_shift; train cov_emb + clf only (use with checkpoint).',
+)
+parser.add_argument(
+    '--clf_lr',
+    type=float,
+    default=None,
+    help='Learning rate for clf (default: same as --learning_rate, or 1e-3 with --freeze_backbone).',
+)
+parser.add_argument(
+    '--cov_emb_lr',
+    type=float,
+    default=None,
+    help='Learning rate for cov_emb (default: same as --learning_rate).',
+)
 args = parser.parse_args()
+
+if args.freeze_backbone and args.clf_lr is None:
+    args.clf_lr = 1e-3
+    print('freeze_backbone: default clf_lr=1e-3', flush=True)
 
 seed_everything(args.seed, workers=True)
 use_parallel = args.num_workers > 0

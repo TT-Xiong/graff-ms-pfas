@@ -91,6 +91,9 @@ class GrAFF(pl.LightningModule):
         ce_ids=None,
         min_probability,
         min_mz,
+        freeze_backbone=False,
+        clf_lr=None,
+        cov_emb_lr=None,
         **kwargs
     ):
         super().__init__()
@@ -108,6 +111,9 @@ class GrAFF(pl.LightningModule):
         self.dropout = dropout
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.freeze_backbone = freeze_backbone
+        self.clf_lr = clf_lr
+        self.cov_emb_lr = cov_emb_lr
 
         if dataset == 'pfas':
             self.precursor_types = precursor_types or pfas_precursor_types
@@ -205,13 +211,73 @@ class GrAFF(pl.LightningModule):
         
         self.isotope_shift = nn.Linear(decoder_dim, len(isotope_types))
         self.clf = nn.Linear(decoder_dim, vocab_size + 1)
-                
-    def configure_optimizers(self): 
-        opt = torch.optim.Adam(
-            self.parameters(), 
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay
+
+        if self.freeze_backbone:
+            self._set_backbone_requires_grad(False)
+
+    _BACKBONE_PREFIXES = (
+        'onehot.',
+        'node_emb.',
+        'edge_emb.',
+        'signnet.',
+        'encoder.',
+        'attn.',
+        'decoder.',
+        'isotope_shift.',
+    )
+
+    def _set_backbone_requires_grad(self, requires_grad):
+        for name, param in self.named_parameters():
+            if any(name.startswith(prefix) for prefix in self._BACKBONE_PREFIXES):
+                param.requires_grad = requires_grad
+
+    def _optimizer_param_groups(self):
+        cov_emb_params = list(self.cov_emb.parameters())
+        clf_params = list(self.clf.parameters())
+        use_split_lr = (
+            self.freeze_backbone
+            or self.clf_lr is not None
+            or self.cov_emb_lr is not None
         )
+        if not use_split_lr:
+            return [{'params': [p for p in self.parameters() if p.requires_grad], 'lr': self.learning_rate}]
+
+        cov_lr = self.cov_emb_lr if self.cov_emb_lr is not None else self.learning_rate
+        clf_lr = self.clf_lr if self.clf_lr is not None else self.learning_rate
+        groups = [
+            {'params': cov_emb_params, 'lr': cov_lr, 'name': 'cov_emb'},
+            {'params': clf_params, 'lr': clf_lr, 'name': 'clf'},
+        ]
+        if not self.freeze_backbone:
+            backbone_params = [
+                param for name, param in self.named_parameters()
+                if param.requires_grad
+                and not name.startswith('cov_emb.')
+                and not name.startswith('clf.')
+            ]
+            if backbone_params:
+                groups.insert(0, {'params': backbone_params, 'lr': self.learning_rate, 'name': 'backbone'})
+        return groups
+
+    def configure_optimizers(self):
+        groups = self._optimizer_param_groups()
+        for group in groups:
+            group.pop('name', None)
+        opt = torch.optim.Adam(groups, weight_decay=self.weight_decay)
+        if self.freeze_backbone:
+            n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            n_total = sum(p.numel() for p in self.parameters())
+            print(
+                f'freeze_backbone: training cov_emb + clf only '
+                f'({n_trainable:,}/{n_total:,} parameters)',
+                flush=True,
+            )
+        elif self.clf_lr is not None or self.cov_emb_lr is not None:
+            lr_msg = ', '.join(
+                f'{g.get("name", "group")} lr={g["lr"]}'
+                for g in self._optimizer_param_groups()
+            )
+            print(f'Layer-wise learning rates: {lr_msg}', flush=True)
         return opt
     
     def forward(self, g):
