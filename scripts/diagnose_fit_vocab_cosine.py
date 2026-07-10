@@ -29,10 +29,9 @@ Usage (on GPU server with best checkpoint):
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -45,11 +44,29 @@ from src.io import read_msp  # noqa: E402
 from src.metrics import ci95, ms_cosine_similarity  # noqa: E402
 
 
-def _load_train_vocab_module():
-    spec = importlib.util.spec_from_file_location("train_graff_ms", REPO_ROOT / "train-graff-ms.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def load_vocab_from_checkpoint(checkpoint: Path) -> pd.DataFrame:
+    """Read the exact vocab saved in a trained GrAFF Lightning checkpoint."""
+    try:
+        ckpt = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(str(checkpoint), map_location="cpu")
+    hp = ckpt.get("hyper_parameters", ckpt.get("hparams", {}))
+    if "vocab" not in hp:
+        raise KeyError(f"No vocab in checkpoint hyperparameters: {checkpoint}")
+    vocab = hp["vocab"]
+    if not isinstance(vocab, pd.DataFrame):
+        vocab = pd.DataFrame(vocab)
+    return vocab.reset_index(drop=True)
+
+
+def vocab_luts(vocab: pd.DataFrame):
+    product_lut = {
+        row.formula: i + 1 for i, row in vocab.iterrows() if row.kind == "product"
+    }
+    loss_lut = {
+        row.formula: i + 1 for i, row in vocab.iterrows() if row.kind == "loss"
+    }
+    return product_lut, loss_lut
 
 
 def export_queries(pkl_path: Path, output_dir: Path) -> None:
@@ -63,22 +80,6 @@ def export_queries(pkl_path: Path, output_dir: Path) -> None:
         out = output_dir / f"{split}.tsv"
         part[cols].to_csv(out, sep="\t", header=False, index=False)
         print(f"{split}: {len(part)} queries -> {out}")
-
-
-def load_union_vocab(checkpoint: Path, train_df: pd.DataFrame, pfas_extension_size: int = 2000):
-    tv = _load_train_vocab_module()
-    nist_vocab = tv.load_nist_vocab_from_checkpoint(str(checkpoint))
-    extensions = tv.learn_extension_vocabulary(
-        train_df, nist_vocab, max_extensions=pfas_extension_size,
-    )
-    vocab = tv.merge_union_vocabulary(nist_vocab, extensions)
-    product_lut = {
-        row.formula: i + 1 for i, row in vocab.iterrows() if row.kind == "product"
-    }
-    loss_lut = {
-        row.formula: i + 1 for i, row in vocab.iterrows() if row.kind == "loss"
-    }
-    return vocab, product_lut, loss_lut
 
 
 def spectrum_vocab_stats(row, product_lut: dict, loss_lut: dict) -> dict:
@@ -147,14 +148,11 @@ def report(
     preds: Dict[str, Path],
     *,
     matchms_tol: float,
-    pfas_extension_size: int,
 ) -> None:
     df = pd.read_pickle(pkl_path)
-    train_df = df.query('split=="train"')
-    vocab, product_lut, loss_lut = load_union_vocab(
-        checkpoint, train_df, pfas_extension_size=pfas_extension_size,
-    )
-    print(f"Model vocab: {len(vocab)} entries ({pfas_extension_size} PFAS ext assumed)")
+    vocab = load_vocab_from_checkpoint(checkpoint)
+    product_lut, loss_lut = vocab_luts(vocab)
+    print(f"Model vocab from checkpoint: {len(vocab)} entries")
     print("=" * 60)
 
     vocab_rows = []
@@ -259,7 +257,6 @@ def main() -> None:
     p_report.add_argument("--pred-val", type=Path, default=None)
     p_report.add_argument("--pred-test", type=Path, default=None)
     p_report.add_argument("--matchms-tol", type=float, default=0.1)
-    p_report.add_argument("--pfas-extension-size", type=int, default=2000)
 
     args = parser.parse_args()
     if args.command == "export-queries":
@@ -276,7 +273,6 @@ def main() -> None:
             args.target_msp_dir,
             preds,
             matchms_tol=args.matchms_tol,
-            pfas_extension_size=args.pfas_extension_size,
         )
 
 
