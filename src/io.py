@@ -59,9 +59,13 @@ def read_mgf(path):
 
 from collections import Counter
 from tqdm import tqdm
+import os
 
 def write_msp(path,mzs,intensities,annots=None,verbose=False,**metadata):
     metadata = {k: [*v] for k,v in metadata.items()}
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(path,'w') as f:
         for i in tqdm(range(len(mzs)),disable=not verbose):
             for k in metadata.keys():
@@ -99,7 +103,7 @@ def read_msp(path,parallel=False,sample=None):
     if sample:
         blocks = blocks[:sample]
     
-    def func(block):
+    def func(block):     #读取msp文件，将msp文件中的数据转换为DataFrame格式
         data = defaultdict(list)
         mzs = []
         intens = []
