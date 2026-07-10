@@ -89,9 +89,78 @@ def formula_mz_table(formulas):
     return formulas.map(formula_mz)
 
 
-def learn_extension_vocabulary(df, nist_vocab, max_extensions=None):
-    """Rank (formula, kind) pairs in PFAS train that are absent from the NIST vocab."""
-    nist_keys = set(zip(nist_vocab['formula'], nist_vocab['kind']))
+def aggregate_pfas_formula_intensities(df):
+    """Sum normalized peak-intensity fractions per (formula, kind) on the train split."""
+    annots = df[['InChIKey', 'products', 'losses', 'intensities', 'peaks']].copy()
+    annots['intensities'] = annots[['intensities', 'peaks']].apply(
+        lambda item: item.intensities[item.peaks] / item.intensities.sum()
+        / np.bincount(item.peaks)[item.peaks],
+        axis=1,
+    )
+    annots = annots.drop(columns=['peaks']).explode(['products', 'losses', 'intensities'])
+
+    products = (
+        annots.groupby('products')['intensities']
+        .sum()
+        .to_frame()
+    )
+    products['kind'] = 'product'
+    products.index.name = 'formula'
+
+    losses = (
+        annots.groupby('losses')['intensities']
+        .sum()
+        .to_frame()
+    )
+    losses['kind'] = 'loss'
+    losses.index.name = 'formula'
+
+    ranked = pd.concat([products, losses], axis=0).reset_index()
+    ranked = ranked[ranked['formula'].astype(str).str.len() > 0]
+    return ranked
+
+
+def rank_nist_vocab_by_pfas_intensity(nist_vocab, df):
+    """Attach PFAS train intensity to each NIST (formula, kind) row and sort descending."""
+    pfas = aggregate_pfas_formula_intensities(df)
+    pfas_lut = {
+        (row.formula, row.kind): row.intensities
+        for row in pfas.itertuples(index=False)
+    }
+    ranked = nist_vocab.copy()
+    ranked['pfas_intensity'] = ranked.apply(
+        lambda row: pfas_lut.get((row.formula, row.kind), 0.0),
+        axis=1,
+    )
+    return ranked.sort_values(
+        ['pfas_intensity', 'formula', 'kind'],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+
+def prune_nist_vocabulary(nist_vocab, df, keep_n):
+    """Keep the top *keep_n* NIST entries by PFAS train annotation intensity."""
+    if keep_n is None or keep_n <= 0:
+        return nist_vocab.reset_index(drop=True)
+    ranked = rank_nist_vocab_by_pfas_intensity(nist_vocab, df)
+    if keep_n >= len(ranked):
+        return ranked.drop(columns=['pfas_intensity']).reset_index(drop=True)
+    pruned = ranked.head(keep_n).drop(columns=['pfas_intensity'])
+    n_zero = int((ranked.head(keep_n)['pfas_intensity'] == 0).sum())
+    print(
+        f'Pruned NIST vocab: kept {keep_n}/{len(nist_vocab)} entries '
+        f'({n_zero} with zero PFAS train intensity)',
+        flush=True,
+    )
+    return pruned.reset_index(drop=True)
+
+
+def learn_extension_vocabulary(df, nist_vocab, max_extensions=None, exclude_keys=None):
+    """Rank (formula, kind) pairs in PFAS train absent from *exclude_keys* (default: full NIST)."""
+    if exclude_keys is None:
+        exclude_keys = set(zip(nist_vocab['formula'], nist_vocab['kind']))
+    else:
+        exclude_keys = set(exclude_keys)
 
     annots = df[['InChIKey', 'products', 'losses', 'intensities', 'peaks']].copy()
     annots['intensities'] = annots[['intensities', 'peaks']].apply(
@@ -122,7 +191,7 @@ def learn_extension_vocabulary(df, nist_vocab, max_extensions=None):
     extensions = pd.concat([products, losses], axis=0).sort_values('intensities', ascending=False)
     extensions = extensions.reset_index()
     extensions = extensions[
-        ~extensions.apply(lambda row: (row['formula'], row['kind']) in nist_keys, axis=1)
+        ~extensions.apply(lambda row: (row['formula'], row['kind']) in exclude_keys, axis=1)
     ]
     extensions = extensions[extensions['formula'].astype(str).str.len() > 0]
     extensions['mz'] = formula_mz_table(extensions['formula'])
@@ -328,6 +397,14 @@ parser.add_argument(
     help='Max PFAS-only (formula, kind) entries appended in union vocab mode',
 )
 parser.add_argument(
+    '--nist_vocab_keep',
+    type=int,
+    default=None,
+    help='Union mode: keep this many NIST (formula, kind) rows ranked by PFAS train '
+         'intensity; removed slots can be filled via --pfas_extension_size. '
+         'Use with --transfer_mode clf_map.',
+)
+parser.add_argument(
     '--transfer_mode',
     choices=['auto', 'union', 'clf_map', 'backbone'],
     default='auto',
@@ -389,6 +466,21 @@ elif args.checkpoint and args.vocab_mode == 'pfas' and args.transfer_mode == 'un
 if args.vocab_mode == 'union' and not args.checkpoint:
     raise ValueError('--vocab_mode union requires --checkpoint with a NIST vocab.')
 
+if args.nist_vocab_keep is not None and args.vocab_mode != 'union':
+    raise ValueError('--nist_vocab_keep requires --vocab_mode union.')
+
+if args.nist_vocab_keep is not None and args.transfer_mode == 'union':
+    raise ValueError(
+        '--nist_vocab_keep reshuffles NIST rows; use --transfer_mode clf_map, not union.',
+    )
+
+if args.nist_vocab_keep is not None and args.transfer_mode == 'auto':
+    args.transfer_mode = 'clf_map'
+    print(
+        'Pruned NIST union: auto-selected transfer_mode=clf_map',
+        flush=True,
+    )
+
 if args.subsample:
     df = df.sample(n=args.subsample, random_state=args.seed)
 
@@ -400,14 +492,24 @@ train_df = df.query('split=="train"')
 
 if args.vocab_mode == 'union':
     print(f'Building union vocabulary (NIST checkpoint + PFAS train)... ', end='', flush=True)
-    nist_vocab = load_nist_vocab_from_checkpoint(args.checkpoint)
+    full_nist_vocab = load_nist_vocab_from_checkpoint(args.checkpoint)
+    nist_vocab = prune_nist_vocabulary(
+        full_nist_vocab, train_df, args.nist_vocab_keep,
+    )
+    kept_nist_keys = set(zip(nist_vocab['formula'], nist_vocab['kind']))
     extensions = learn_extension_vocabulary(
-        train_df, nist_vocab, max_extensions=args.pfas_extension_size,
+        train_df,
+        full_nist_vocab,
+        max_extensions=args.pfas_extension_size,
+        exclude_keys=kept_nist_keys,
     )
     vocab = merge_union_vocabulary(nist_vocab, extensions)
     vocab_size = len(vocab)
+    n_pruned = len(full_nist_vocab) - len(nist_vocab)
     print(
-        f'{vocab_size} formulas ({len(nist_vocab)} NIST + {len(extensions)} PFAS-only)',
+        f'{vocab_size} formulas ({len(nist_vocab)} NIST'
+        f'{f", pruned {n_pruned}" if n_pruned else ""}'
+        f' + {len(extensions)} PFAS-only)',
         flush=True,
     )
 else:
@@ -581,7 +683,7 @@ _graff_hparams = {
     k: v for k, v in args.__dict__.items()
     if k not in {
         'df_path', 'dataset', 'checkpoint', 'vocab_mode',
-        'pfas_extension_size', 'transfer_mode',
+        'pfas_extension_size', 'nist_vocab_keep', 'transfer_mode',
     }
 }
 
