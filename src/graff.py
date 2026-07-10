@@ -94,6 +94,8 @@ class GrAFF(pl.LightningModule):
         freeze_backbone=False,
         clf_lr=None,
         cov_emb_lr=None,
+        cov_conditioning='add',
+        cov_emb_dim=None,
         **kwargs
     ):
         super().__init__()
@@ -114,6 +116,13 @@ class GrAFF(pl.LightningModule):
         self.freeze_backbone = freeze_backbone
         self.clf_lr = clf_lr
         self.cov_emb_lr = cov_emb_lr
+        self.cov_conditioning = cov_conditioning
+        if cov_emb_dim is not None:
+            self.cov_emb_dim = cov_emb_dim
+        elif cov_conditioning == 'both':
+            self.cov_emb_dim = 768
+        else:
+            self.cov_emb_dim = encoder_dim
 
         if dataset == 'pfas':
             self.precursor_types = precursor_types or pfas_precursor_types
@@ -193,13 +202,31 @@ class GrAFF(pl.LightningModule):
             dropout=dropout
         )
         
-        self.cov_emb = nn.Sequential(
-            nn.Linear(self.covariates_dim, encoder_dim),
-            nn.SiLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.LayerNorm(encoder_dim),
-            nn.Linear(encoder_dim, encoder_dim)
-        )
+        if cov_conditioning == 'film_decoder':
+            self.cov_emb = nn.Sequential(
+                nn.Linear(self.covariates_dim, encoder_dim),
+                nn.SiLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.LayerNorm(encoder_dim),
+                nn.Linear(encoder_dim, encoder_dim),
+            )
+        else:
+            self.cov_emb = nn.Sequential(
+                nn.Linear(self.covariates_dim, self.cov_emb_dim),
+                nn.SiLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.LayerNorm(self.cov_emb_dim),
+                nn.Linear(self.cov_emb_dim, encoder_dim),
+            )
+
+        if cov_conditioning in ('film_decoder', 'both'):
+            self.cov_film = nn.Sequential(
+                nn.Linear(self.covariates_dim, decoder_dim),
+                nn.SiLU(inplace=True),
+                nn.Linear(decoder_dim, decoder_dim * 2),
+            )
+        else:
+            self.cov_film = None
         
         self.attn = nn.Linear(encoder_dim, 1)
         
@@ -233,6 +260,8 @@ class GrAFF(pl.LightningModule):
 
     def _optimizer_param_groups(self):
         cov_emb_params = list(self.cov_emb.parameters())
+        if self.cov_film is not None:
+            cov_emb_params += list(self.cov_film.parameters())
         clf_params = list(self.clf.parameters())
         use_split_lr = (
             self.freeze_backbone
@@ -253,6 +282,7 @@ class GrAFF(pl.LightningModule):
                 param for name, param in self.named_parameters()
                 if param.requires_grad
                 and not name.startswith('cov_emb.')
+                and not name.startswith('cov_film.')
                 and not name.startswith('clf.')
             ]
             if backbone_params:
@@ -279,6 +309,13 @@ class GrAFF(pl.LightningModule):
             )
             print(f'Layer-wise learning rates: {lr_msg}', flush=True)
         return opt
+
+    def _apply_cov_film(self, z, covariates):
+        if self.cov_film is None:
+            return z
+        cov_in = covariates.view(z.shape[0], self.covariates_dim)
+        gamma, beta = self.cov_film(cov_in).chunk(2, dim=-1)
+        return z * (1.0 + gamma) + beta
     
     def forward(self, g):
         batch_size = len(g.ptr) - 1
@@ -301,9 +338,10 @@ class GrAFF(pl.LightningModule):
         z = pyg.nn.global_add_pool(x_mol * w, g.batch)
         
         # condition molecule representation on covariates
-        z = z + self.cov_emb(g.covariates)         #分子经GNN后的z与元数据拼接
+        z = z + self.cov_emb(g.covariates.view(batch_size, self.covariates_dim))
         # transform to spectrum representation
         z = self.decoder(z)
+        z = self._apply_cov_film(z, g.covariates)
         # and predict logits
         log_y_pred = self.clf(z)
         

@@ -267,7 +267,7 @@ def transfer_graff_weights(
     Transfer NIST-pretrained weights into a PFAS model.
 
     - GNN / decoder / isotope_shift: copy when shapes match
-    - cov_emb: skip (NIST 7-dim vs PFAS 11-dim)
+    - cov_emb / cov_film: skip (NIST 7-dim vs PFAS 11-dim; CE-FiLM is PFAS-only)
     - clf (union): copy first NIST rows; append random rows for extensions
     - clf (pfas / clf_map): copy rows matched by (formula, kind)
     - clf (backbone): skip clf entirely
@@ -290,7 +290,7 @@ def transfer_graff_weights(
     clf_mode = transfer_mode
 
     for key, value in pretrained_sd.items():
-        if key.startswith('cov_emb.') or key.startswith('vocab_mzs') or key.startswith('vocab_kinds'):
+        if key.startswith('cov_emb.') or key.startswith('cov_film.') or key.startswith('vocab_mzs') or key.startswith('vocab_kinds'):
             skipped.append(key)
             continue
         if key not in model_sd:
@@ -440,11 +440,32 @@ parser.add_argument(
     default=0.0,
     help='Minimum val/loss decrease to count as improvement for early stopping.',
 )
+parser.add_argument(
+    '--cov_conditioning',
+    choices=['add', 'film_decoder', 'both'],
+    default='add',
+    help='PFAS covariate fusion: add (default, optional wide MLP via --cov_emb_dim), '
+         'film_decoder (compact cov_emb + FiLM on decoder), '
+         'both (768-d hidden cov_emb + FiLM).',
+)
+parser.add_argument(
+    '--cov_emb_dim',
+    type=int,
+    default=None,
+    help='Hidden width of cov_emb MLP (default: encoder_dim). Try 768 with encoder_dim=512.',
+)
 args = parser.parse_args()
 
 if args.freeze_backbone and args.clf_lr is None:
     args.clf_lr = 1e-3
     print('freeze_backbone: default clf_lr=1e-3', flush=True)
+
+if args.cov_conditioning != 'add':
+    print(
+        f'Covariate conditioning: {args.cov_conditioning} '
+        f'(cov_emb_dim={args.cov_emb_dim or args.encoder_dim})',
+        flush=True,
+    )
 
 seed_everything(args.seed, workers=True)
 use_parallel = args.num_workers > 0
