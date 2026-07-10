@@ -428,6 +428,18 @@ parser.add_argument(
     default=None,
     help='Learning rate for cov_emb (default: same as --learning_rate).',
 )
+parser.add_argument(
+    '--early_stopping_patience',
+    type=int,
+    default=0,
+    help='Stop if val/loss does not improve for this many epochs (0 = disabled).',
+)
+parser.add_argument(
+    '--early_stopping_min_delta',
+    type=float,
+    default=0.0,
+    help='Minimum val/loss decrease to count as improvement for early stopping.',
+)
 args = parser.parse_args()
 
 if args.freeze_backbone and args.clf_lr is None:
@@ -679,6 +691,29 @@ for split in datasets:
 # fit model
 ################################################################
 
+callbacks = [
+    ModelCheckpoint(
+        monitor='val/loss',
+        mode='min',
+        save_top_k=1,
+    ),
+]
+if args.early_stopping_patience > 0:
+    callbacks.append(
+        EarlyStopping(
+            monitor='val/loss',
+            mode='min',
+            patience=args.early_stopping_patience,
+            min_delta=args.early_stopping_min_delta,
+            verbose=True,
+        )
+    )
+    print(
+        f'Early stopping: patience={args.early_stopping_patience}, '
+        f'min_delta={args.early_stopping_min_delta}',
+        flush=True,
+    )
+
 trainer = pl.Trainer(
     accelerator='gpu' if args.gpus else 'cpu', 
     devices=args.gpus if args.gpus else None,
@@ -691,13 +726,7 @@ trainer = pl.Trainer(
         default_hp_metric=False,
         name='graff'
     ),
-    callbacks=[
-        ModelCheckpoint(
-            monitor='val/loss', 
-            mode='min',
-            save_top_k=1
-        )
-    ],
+    callbacks=callbacks,
 )
 
 _graff_hparams = {
@@ -705,6 +734,7 @@ _graff_hparams = {
     if k not in {
         'df_path', 'dataset', 'checkpoint', 'vocab_mode',
         'pfas_extension_size', 'nist_vocab_keep', 'transfer_mode',
+        'early_stopping_patience', 'early_stopping_min_delta',
     }
 }
 
