@@ -489,7 +489,25 @@ parser.add_argument(
     '--ce_encoding',
     choices=['onehot', 'continuous'],
     default='onehot',
-    help='PFAS only: CE covariate style. continuous uses normalized eV/60 as one ordered scalar.',
+    help='PFAS only: CE covariate style. continuous uses normalized eV/ce_max_ev.',
+)
+parser.add_argument(
+    '--ce_max_ev',
+    type=float,
+    default=60.0,
+    help='PFAS continuous CE divisor (default 60). Zhang OECD data uses 120 with clip.',
+)
+parser.add_argument(
+    '--ce_clip_min',
+    type=float,
+    default=None,
+    help='Optional lower clip for continuous CE eV before normalization.',
+)
+parser.add_argument(
+    '--ce_clip_max',
+    type=float,
+    default=None,
+    help='Optional upper clip for continuous CE eV before normalization.',
 )
 args = parser.parse_args()
 
@@ -551,7 +569,13 @@ if args.ce_embed_dim:
 elif args.ce_encoding == 'continuous':
     if args.dataset != 'pfas':
         raise ValueError('--ce_encoding continuous is only supported for PFAS training.')
-    print('CE encoding: continuous normalized eV/60 (replaces CE one-hot)', flush=True)
+    clip_msg = ''
+    if args.ce_clip_min is not None or args.ce_clip_max is not None:
+        clip_msg = f', clip=[{args.ce_clip_min},{args.ce_clip_max}]'
+    print(
+        f'CE encoding: continuous eV/{args.ce_max_ev}{clip_msg} (replaces CE one-hot)',
+        flush=True,
+    )
 
 if args.vocab_mode is None:
     args.vocab_mode = 'union' if args.checkpoint else 'pfas'
@@ -697,6 +721,9 @@ def featurize_spectrum(item):
             ce_embed_dim=args.ce_embed_dim,
             ce_encoding=args.ce_encoding,
             eV=getattr(item, 'eV', None),
+            ce_max_ev=args.ce_max_ev,
+            ce_clip_min=args.ce_clip_min,
+            ce_clip_max=args.ce_clip_max,
         )
     else:
         covariates = build_covariates(

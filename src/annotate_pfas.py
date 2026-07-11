@@ -35,12 +35,9 @@ from tqdm import tqdm
 
 RDLogger.DisableLog("rdApp.*")
 
-# Allow running as `python src/annotate_pfas.py` from repo root.
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-from src.graff import atom_types, isotope_types, neutron_mass
+atom_types = sorted(["C", "H", "N", "O", "P", "S", "F", "Cl", "Br", "I"])
+isotope_types = [0, 1, 2]
+neutron_mass = 1.008665
 from src.io import write_msp
 
 
@@ -48,6 +45,14 @@ from src.io import write_msp
 PRECURSOR_TYPES = ["[M-H]-", "[M]+", "[M+H]+", "[M-2H]-"]
 DISSOCIATION_TYPES = ["HCD", "CID"]
 DISSOCIATION_ID = {"HCD": 0, "CID": 1}
+# Map MGF SOURCE_INSTRUMENT (stored in Dissociation_type column) to HCD/CID covariates.
+INSTRUMENT_TO_DISSOCIATION = {
+    "HCD": "HCD",
+    "CID": "CID",
+    "ORBITRAP": "HCD",
+    "QTOF": "CID",
+    "QTof": "CID",
+}
 CE_BINS = [15, 30, 45, 60]
 CE_ID = {15: 0, 30: 1, 45: 2, 60: 3}
 
@@ -142,6 +147,17 @@ def assign_ce_bin(ev: float, *, tolerance: float = 0.5) -> Optional[int]:
     if abs(best - ev) <= tolerance:
         return best
     return None
+
+
+def map_dissociation_type(raw: str) -> str:
+    """Normalize MGF instrument / dissociation labels to HCD or CID."""
+    return INSTRUMENT_TO_DISSOCIATION.get(str(raw).strip().upper(), str(raw).strip().upper())
+
+
+def assign_nearest_ce_id(ev: float) -> int:
+    """Nearest legacy CE bin id (for loss weighting / reporting only)."""
+    best = min(CE_BINS, key=lambda b: abs(b - float(ev)))
+    return CE_ID[best]
 
 
 @lru_cache(maxsize=4096)
@@ -475,6 +491,8 @@ def _prepare_row(
     max_candidates_per_peak: int,
     max_precursor_mz: float,
     ce_tolerance: float,
+    ce_mode: str = "bin",
+    ce_clip: Tuple[float, float] = (10.0, 120.0),
 ) -> Optional[dict]:
     if str(row.get("MSLEVEL", "2")) not in ("2", 2):
         return None
@@ -486,7 +504,7 @@ def _prepare_row(
     if precursor_type not in PRECURSOR_TYPES:
         return None
 
-    dissociation_type = str(row.get("Dissociation_type", "")).strip().upper()
+    dissociation_type = map_dissociation_type(row.get("Dissociation_type", ""))
     if dissociation_type not in DISSOCIATION_TYPES:
         return None
 
@@ -510,11 +528,21 @@ def _prepare_row(
     if np.isnan(precursor_mz) or precursor_mz > max_precursor_mz:
         return None
 
-    ev, nce = parse_collision_energy(row.get("Collision_energy"), precursor_mz)
-    ce_bin = assign_ce_bin(ev, tolerance=ce_tolerance)
-    if ce_bin is None:
+    ev_raw, nce = parse_collision_energy(row.get("Collision_energy"), precursor_mz)
+    if ev_raw is None or np.isnan(ev_raw):
         return None
-    ce_id = CE_ID[ce_bin]
+
+    if ce_mode == "continuous":
+        lo, hi = ce_clip
+        ev_use = float(np.clip(ev_raw, lo, hi))
+        ce_id = assign_nearest_ce_id(ev_raw)
+        ce_bin = CE_BINS[ce_id]
+    else:
+        ce_bin = assign_ce_bin(ev_raw, tolerance=ce_tolerance)
+        if ce_bin is None:
+            return None
+        ce_id = CE_ID[ce_bin]
+        ev_use = float(ce_bin)
 
     mzs = np.asarray(row["mzs"], dtype=np.float64)
     intensities = np.asarray(row["intensities"], dtype=np.float64)
@@ -544,9 +572,11 @@ def _prepare_row(
         "PrecursorMZ": precursor_mz,
         "Dissociation_type": dissociation_type,
         "Dissociation_id": DISSOCIATION_ID[dissociation_type],
-        "eV": float(ce_bin),
-        "NCE": float(nce) if not np.isnan(nce) else float(ce_bin * 500.0 / precursor_mz),
+        "eV": ev_use,
+        "CE_eV_raw": float(ev_raw),
+        "NCE": float(nce) if not np.isnan(nce) else float(ev_use * 500.0 / precursor_mz),
         "CE_ID": ce_id,
+        "CE_bin": int(ce_bin),
         "mzs": mzs.astype(np.float32),
         "intensities": intensities_norm.astype(np.float32),
         "peaks": peaks,
@@ -598,11 +628,16 @@ def annotate_mgf_paths(
     min_annotation_coverage: float = 0.0,
     dissociation_types: Optional[Sequence[str]] = None,
     ce_tolerance: float = 0.5,
+    ce_mode: str = "bin",
+    ce_clip: Tuple[float, float] = (10.0, 120.0),
+    precursor_types: Optional[Sequence[str]] = None,
     sample: Optional[int] = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     if dissociation_types is None:
         dissociation_types = DISSOCIATION_TYPES
+    if precursor_types is None:
+        precursor_types = PRECURSOR_TYPES
 
     frames = []
     for path in mgf_paths:
@@ -610,8 +645,10 @@ def annotate_mgf_paths(
             print(f"Reading {path}...", flush=True)
         raw = read_mgf(path)
         if "Dissociation_type" in raw.columns:
-            raw["Dissociation_type"] = raw["Dissociation_type"].str.upper()
+            raw["Dissociation_type"] = raw["Dissociation_type"].map(map_dissociation_type)
             raw = raw[raw["Dissociation_type"].isin(dissociation_types)]
+        if "Precursor_type" in raw.columns:
+            raw = raw[raw["Precursor_type"].isin(precursor_types)]
         frames.append(raw)
 
     df_in = pd.concat(frames, ignore_index=True)
@@ -631,6 +668,8 @@ def annotate_mgf_paths(
             max_candidates_per_peak=max_candidates_per_peak,
             max_precursor_mz=max_precursor_mz,
             ce_tolerance=ce_tolerance,
+            ce_mode=ce_mode,
+            ce_clip=ce_clip,
         )
         if rec is None:
             continue

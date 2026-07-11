@@ -207,9 +207,12 @@ class MoleculeFeaturizer:
                     precursor_types_list=list(self.hparams.precursor_types),
                     ce_ids_list=list(getattr(self.hparams, 'ce_ids', ce_ids) or ce_ids),
                     ce_embed_dim=ce_embed_dim,
-                    ce_encoding=ce_encoding,
-                    eV=item.get('eV'),
-                )
+                ce_encoding=ce_encoding,
+                eV=item.get('eV'),
+                ce_max_ev=getattr(self.hparams, 'ce_max_ev', 60.0),
+                ce_clip_min=getattr(self.hparams, 'ce_clip_min', None),
+                ce_clip_max=getattr(self.hparams, 'ce_clip_max', None),
+            )
             else:
                 covariates = build_covariates(
                     dataset='nist',
