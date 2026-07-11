@@ -197,6 +197,7 @@ class MoleculeFeaturizer:
 
             if self.dataset == 'pfas':
                 ce_embed_dim = getattr(self.hparams, 'ce_embed_dim', None)
+                ce_encoding = getattr(self.hparams, 'ce_encoding', 'onehot')
                 covariates = build_covariates(
                     dataset='pfas',
                     precursor_type=item['Precursor_type'],
@@ -206,6 +207,8 @@ class MoleculeFeaturizer:
                     precursor_types_list=list(self.hparams.precursor_types),
                     ce_ids_list=list(getattr(self.hparams, 'ce_ids', ce_ids) or ce_ids),
                     ce_embed_dim=ce_embed_dim,
+                    ce_encoding=ce_encoding,
+                    eV=item.get('eV'),
                 )
             else:
                 covariates = build_covariates(

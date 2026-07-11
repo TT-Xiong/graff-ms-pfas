@@ -485,6 +485,12 @@ parser.add_argument(
     help='PFAS only: learnable CE_ID embedding size (replaces CE one-hot in covariates). '
          'Try 32 with film_decoder.',
 )
+parser.add_argument(
+    '--ce_encoding',
+    choices=['onehot', 'continuous'],
+    default='onehot',
+    help='PFAS only: CE covariate style. continuous uses normalized eV/60 as one ordered scalar.',
+)
 args = parser.parse_args()
 
 if args.freeze_backbone and args.clf_lr is None:
@@ -539,7 +545,13 @@ print(f'Dataset mode: {args.dataset} ({len(df)} spectra)')
 if args.ce_embed_dim:
     if args.dataset != 'pfas':
         raise ValueError('--ce_embed_dim is only supported for PFAS training.')
+    if args.ce_encoding != 'onehot':
+        raise ValueError('--ce_embed_dim cannot be combined with --ce_encoding continuous.')
     print(f'CE embedding: dim={args.ce_embed_dim} (replaces CE one-hot)', flush=True)
+elif args.ce_encoding == 'continuous':
+    if args.dataset != 'pfas':
+        raise ValueError('--ce_encoding continuous is only supported for PFAS training.')
+    print('CE encoding: continuous normalized eV/60 (replaces CE one-hot)', flush=True)
 
 if args.vocab_mode is None:
     args.vocab_mode = 'union' if args.checkpoint else 'pfas'
@@ -683,6 +695,8 @@ def featurize_spectrum(item):
             precursor_types_list=active_precursor_types,
             ce_ids_list=ce_ids,
             ce_embed_dim=args.ce_embed_dim,
+            ce_encoding=args.ce_encoding,
+            eV=getattr(item, 'eV', None),
         )
     else:
         covariates = build_covariates(

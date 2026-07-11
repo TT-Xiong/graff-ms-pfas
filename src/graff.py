@@ -28,9 +28,31 @@ ce_ids = [0, 1, 2, 3]
 ce_bins = [15, 30, 45, 60]
 
 
-def compute_covariates_dim(dataset, *, precursor_types, instruments, ce_ids, ce_embed_dim=None):
+def normalize_ce_value(*, ce_id=None, eV=None) -> float:
+    """Map collision energy to a monotonic scalar in (0, 1], using eV / max(ce_bins)."""
+    if eV is not None:
+        return float(eV) / float(max(ce_bins))
+    if ce_id is not None:
+        return float(ce_bins[int(ce_id)]) / float(max(ce_bins))
+    raise ValueError("Either ce_id or eV is required")
+
+
+def compute_covariates_dim(
+    dataset,
+    *,
+    precursor_types,
+    instruments,
+    ce_ids,
+    ce_embed_dim=None,
+    ce_encoding='onehot',
+):
     if dataset == 'pfas':
-        ce_part = 0 if ce_embed_dim else len(ce_ids)
+        if ce_embed_dim:
+            ce_part = 0
+        elif ce_encoding == 'continuous':
+            ce_part = 1
+        else:
+            ce_part = len(ce_ids)
         return len(dissociation_types) + ce_part + len(precursor_types) + 1
     return len(instruments) + len(precursor_types) + 1 + 1
 
@@ -48,6 +70,8 @@ def build_covariates(
     instruments_list=None,
     ce_ids_list=None,
     ce_embed_dim=None,
+    ce_encoding='onehot',
+    eV=None,
 ):
     """Build the covariate vector consumed by ``GrAFF.cov_emb``."""
     if dataset == 'pfas':
@@ -61,6 +85,9 @@ def build_covariates(
         pt_onehot[pt_list.index(precursor_type)] = 1.0
         if ce_embed_dim:
             return np.array([*diss_onehot, *pt_onehot, float(has_isotopes)], dtype=np.float32)
+        if ce_encoding == 'continuous':
+            ce_value = normalize_ce_value(ce_id=ce_idx, eV=eV)
+            return np.array([*diss_onehot, ce_value, *pt_onehot, float(has_isotopes)], dtype=np.float32)
         ce_onehot = [0.0] * len(ce_list)
         ce_onehot[ce_idx] = 1.0
         return np.array([*diss_onehot, *ce_onehot, *pt_onehot, float(has_isotopes)], dtype=np.float32)
@@ -102,6 +129,7 @@ class GrAFF(pl.LightningModule):
         cov_emb_dim=None,
         ce_loss_weights=None,
         ce_embed_dim=None,
+        ce_encoding='onehot',
         **kwargs
     ):
         super().__init__()
@@ -123,6 +151,7 @@ class GrAFF(pl.LightningModule):
         self.clf_lr = clf_lr
         self.cov_emb_lr = cov_emb_lr
         self.cov_conditioning = cov_conditioning
+        self.ce_encoding = ce_encoding
         self.use_ce_loss_weights = ce_loss_weights is not None
         if self.use_ce_loss_weights:
             self.register_buffer(
@@ -153,6 +182,7 @@ class GrAFF(pl.LightningModule):
             instruments=self.instruments,
             ce_ids=self.ce_ids,
             ce_embed_dim=ce_embed_dim,
+            ce_encoding=ce_encoding,
         )
         vocab_size = len(vocab)
         self.vocab_size = vocab_size
